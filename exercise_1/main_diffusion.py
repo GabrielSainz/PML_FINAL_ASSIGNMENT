@@ -25,7 +25,7 @@ loader_for_latents = DataLoader(
 # 3) Diffusion config (tweak as needed)
 cfg = DiffusionConfig(
     run_root=f"{path_root}/runs_diffusion",
-    run_name="latent_priors_z16_beta0.01",  # name your run
+    run_name="latent_priors_z16_beta0.1",  # name your run
     epochs=30,
     lr=2e-4,
     batch_size=512,
