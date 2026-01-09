@@ -3,7 +3,7 @@ import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, random_split
 
-from exercise_1.utils.VAE import VAEConfig, train_vae
+from utils.VAE import VAEConfig, train_vae
 
 def main():
     # -------------------------
