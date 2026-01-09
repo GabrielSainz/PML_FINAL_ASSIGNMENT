@@ -1,49 +1,42 @@
+# scripts/run_latent_diffusion.py
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
 import torch
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
 
-from utils.diffusion import DiffusionConfig, train_latent_priors
+from utils.train_diffusion import train_diffusion_on_vae_latents
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# 1) Point to the VAE run you selected
-path_root="/content/drive/MyDrive/University_of_Copenhagen/block6/PML/final_assignment/exercise_1"
-vae_run_dir = f"{path_root}/runs_vae/mnist_betaVAE_z16_beta0.01_e15_lr0.002_seed42"
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", type=str, required=True, help='e.g. "z16_beta0.01"')
+    ap.add_argument(
+        "--path_root",
+        type=str,
+        default="/content/drive/MyDrive/University_of_Copenhagen/block6/PML/final_assignment/exercise_1",
+    )
+    # Keep these as args only if you want flexibility; otherwise hardcode them.
+    ap.add_argument("--e", type=int, default=15)
+    ap.add_argument("--lr", type=float, default=0.002)
+    ap.add_argument("--seed", type=int, default=42)
 
-# 2) Data loader used ONLY to build latent dataset (shuffle=False recommended)
-transform = transforms.ToTensor()
-mnist_train = datasets.MNIST(f"{path_root}/mnist_data", download=True, train=True, transform=transform)
+    args = ap.parse_args()
 
-loader_for_latents = DataLoader(
-    mnist_train,
-    batch_size=256,
-    shuffle=False,   # stable ordering
-    num_workers=2,
-    pin_memory=True
-)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"[info] device = {device}")
 
-# 3) Diffusion config (tweak as needed)
-cfg = DiffusionConfig(
-    run_root=f"{path_root}/runs_diffusion",
-    run_name="latent_priors_z16_beta1",  # name your run
-    epochs=30,
-    lr=2e-4,
-    batch_size=512,
-    ddpm_T=200,
-    sample_steps_cont=200,
-    hidden=256,
-    depth=3,
-    ema_decay=0.999,
-    n_plot=25,
-    plot_every_epochs=0,  # set e.g. 10 if you want intermediate sample PDFs
-)
+    path_root = Path(args.path_root)
+    vae_run_dir = path_root / "runs_vae" / f"mnist_betaVAE_{args.model}_e{args.e}_lr{args.lr}_seed{args.seed}"
 
-run_dir, metrics = train_latent_priors(
-    vae_run_dir=vae_run_dir,
-    train_loader_for_latents=loader_for_latents,
-    device=device,
-    cfg=cfg,
-)
+    if not vae_run_dir.exists():
+        raise FileNotFoundError(
+            f"VAE run dir not found:\n  {vae_run_dir}\n"
+            f"Check --model / --e / --lr / --seed or pass the correct path_root."
+        )
 
-print("Done. Outputs in:", run_dir)
-print(metrics)
+    train_diffusion_on_vae_latents(args.model, str(path_root), str(vae_run_dir))
+
+
+if __name__ == "__main__":
+    main()
