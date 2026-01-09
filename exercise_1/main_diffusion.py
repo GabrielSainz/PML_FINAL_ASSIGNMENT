@@ -29,11 +29,11 @@ def main() -> None:
     path_root = Path(args.path_root)
     vae_run_dir = path_root / "runs_vae" / f"mnist_betaVAE_{args.model}_e{args.e}_lr{args.lr}_seed{args.seed}"
 
-    if not vae_run_dir.exists():
-        raise FileNotFoundError(
-            f"VAE run dir not found:\n  {vae_run_dir}\n"
-            f"Check --model / --e / --lr / --seed or pass the correct path_root."
-        )
+    #if not vae_run_dir.exists():
+    #    raise FileNotFoundError(
+    #        f"VAE run dir not found:\n  {vae_run_dir}\n"
+    #        f"Check --model / --e / --lr / --seed or pass the correct path_root."
+    #    )
 
     train_diffusion_on_vae_latents(args.model, str(path_root), str(vae_run_dir))
 
