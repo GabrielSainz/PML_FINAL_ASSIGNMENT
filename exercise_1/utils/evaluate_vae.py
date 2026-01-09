@@ -50,7 +50,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 # Load your VAE model class
 # -------------------------
 # This expects vae.py in the same directory / PYTHONPATH
-from VAE import BetaVAE, beta_vae_loss
+from utils.VAE import BetaVAE, beta_vae_loss
 
 
 # =========================
