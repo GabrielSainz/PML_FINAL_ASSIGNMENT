@@ -29,10 +29,10 @@ def train_diffusion_on_vae_latents(model, path_root, vae_run_dir):
     cfg = DiffusionConfig(
         run_root=f"{path_root}/runs_diffusion",
         run_name=f"latent_priors_{model}",  # name your run
-        epochs=30,
+        epochs=45,
         lr=2e-4,
         batch_size=512,
-        ddpm_T=200,
+        ddpm_T=1000,
         sample_steps_cont=200,
         hidden=256,
         depth=3,
