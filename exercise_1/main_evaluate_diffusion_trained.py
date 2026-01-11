@@ -9,7 +9,7 @@ rows = evaluate_diffusion_runs(
     out_dir=f"{root_path}/runs_diffusion/summary_fixed_net",
     data_dir=f"{root_path}/mnist_data",
     device=device,
-    feature_net_ckpt="utils/mnist_feature_net.pt",
+    feature_net_ckpt="/content/PML_FINAL_ASSIGNMENT/exercise_1/utils/mnist_feature_net.pt",
     n_gen=5000,           # 10k if you want tighter estimates
     validity_thresh=0.9,
 )
