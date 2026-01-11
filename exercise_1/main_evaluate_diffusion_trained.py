@@ -12,7 +12,6 @@ rows = evaluate_diffusion_runs(
     feature_net_ckpt="utils/mnist_feature_net.pt",
     n_gen=5000,           # 10k if you want tighter estimates
     validity_thresh=0.9,
-    clf_epochs=3,         # trains once, cached in summary/
 )
 
 print(f"Done. See {root_path}/runs_diffusion/summary_fixed_net/")
