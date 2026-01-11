@@ -14,7 +14,7 @@ import pyro.distributions as dist
 from pyro.infer import MCMC, NUTS
 from pyro.infer.autoguide.initialization import init_to_value
 
-#python exercise_2/gp_p2_q3.py --data exercise_2/data_part_B.csv --summary exercise_2/results_b2_gp/summary_table_b2.csv --kernel best --outdir exercise_2/results_b2_3_2 --jitter 1e-4 --num_chains 4
+#python exercise_2/gp_p2_q3.py --data exercise_2/data_part_B.csv --summary exercise_2/results_b2_gp/summary_table_b2.csv --kernel best --outdir exercise_2/results_b2_3_9_10 --jitter 1e-4 --num_chains 4
 
 
 # -------------------------
@@ -334,7 +334,7 @@ def main():
         azsum = az.summary(idata, var_names=["Delta"])
         azsum.to_csv(tables_dir / "arviz_summary_delta.csv")
         # Trace plots for Δ9 and Δ10 if ArviZ exists
-        az.plot_trace(idata, var_names=["Delta"], coords={"Delta_dim_0": [8, 9]})
+        az.plot_trace(idata, var_names=["Delta"], coords={"Delta_dim_0": [9, 10]})
         plt.tight_layout()
         plt.savefig(plots_dir / "arviz_trace_delta9_delta10.pdf", bbox_inches="tight")
         plt.close()
@@ -342,7 +342,7 @@ def main():
         (tables_dir / "arviz_not_available.txt").write_text(f"ArviZ failed or not installed: {repr(e)}\n")
 
     # Exercise-required scatter of (Δ9, Δ10) (1-indexed -> indices 8 and 9)
-    idx9, idx10 = 8, 9
+    idx9, idx10 = 9, 10
     fig = plt.figure(figsize=(6, 6))
     ax = plt.gca()
     ax.scatter(Delta_flat[:, idx9], Delta_flat[:, idx10], s=10, alpha=0.5, label="posterior samples")
