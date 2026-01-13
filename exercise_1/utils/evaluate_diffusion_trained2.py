@@ -1,35 +1,24 @@
-# evaluate_diffusion.py
+# utils/evaluate_diffusion_trained2.py
 """
 Evaluate:
-1) Latent diffusion priors (DDPM + Continuous VP-SDE) in runs_diffusion/
-2) Pixel-space models (baseline DDPM + Flow Matching) from a checkpoint folder
+1) Latent priors trained in run_root (VAE prior / latent DDPM / continuous VP-SDE)
+2) Pixel-space baseline DDPM + Flow Matching (checkpoints in pixel_ckpt_dir)
 
-Metrics per model:
-- mnist_fid ↓          (FID computed in MNISTFeatureNet feature space)
-- mean_conf ↑          (avg max softmax prob)
-- unique_digits ↑      (#unique predicted digits among VALID samples only)
-- sampling_time_s      (TOTAL time for n_gen samples, includes sampling + any decoding)
-
-Quickcheck PDFs (saved into out_dir/quickcheck/):
-- Latent runs: recon 2 rows × 12 cols (original + recon) -> one PDF per latent run
-- All models (latent priors + pixel models): generated samples 1 row × 12 cols -> one PDF per model
+Uses a FIXED, PRETRAINED MNISTFeatureNet for all metrics.
 
 Outputs in out_dir:
 - summary.csv
 - sample_validity.pdf
 - fid_scores.pdf
-- label_histograms.pdf
-- quickcheck/*.pdf
+- sampling_time.pdf
+- label_histograms.pdf (multi-page)
+- quickcheck_gen__*.pdf (1 row, 12 cols) for each evaluated model
+- quickcheck_recon__*.pdf (2 rows original/recon, 12 cols) for each latent run's VAE (optional)
 
-Latent diffusion run structure assumed:
-  config.json (contains "vae_run_dir")
-  models/ddpm.pt
-  models/cont.pt
-  latents/mnist_latents_mu.pt
-
-Pixel checkpoints assumed:
-  pixel_ckpt_dir / baseline_ckpt_name
-  pixel_ckpt_dir / flow_ckpt_name
+Important:
+- Pixel models in your setup were trained on FLAT 784 tensors in [-1,1] (dequantized),
+  so we MUST map generated samples [-1,1] -> [0,1] before plotting / feature net eval.
+- Real MNIST features are computed from ToTensor() only (images in [0,1], shape [B,1,28,28]).
 """
 
 from __future__ import annotations
@@ -48,63 +37,36 @@ from matplotlib.backends.backend_pdf import PdfPages
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 
-# Project imports
-from utils.VAE import BetaVAE
+# ---- Your project imports (latent side)
 from utils.latent_utils import load_latent_checkpoint
-from utils.diffusion import LatentDenoiser, LatentDDPM, VPSDE, load_vae_from_run
 
+# We try to use your exact training-time diffusion code (recommended).
+# If these imports fail, you should point them to your actual module path.
+try:
+    from utils.diffusion import LatentDenoiser, LatentDDPM, VPSDE, load_vae_from_run
+except Exception as e:
+    raise ImportError(
+        "Could not import LatentDenoiser/LatentDDPM/VPSDE/load_vae_from_run from utils.diffusion.\n"
+        "Fix the import path in utils/evaluate_diffusion_trained2.py to match your project.\n"
+        f"Original error: {repr(e)}"
+    )
 
-# =============================================================================
-# IO helpers
-# =============================================================================
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def _read_json(path: str) -> Optional[Dict[str, Any]]:
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def list_diffusion_runs(run_root: str) -> List[str]:
-    if not run_root or (not os.path.exists(run_root)):
-        return []
-    out = []
-    for name in sorted(os.listdir(run_root)):
-        p = os.path.join(run_root, name)
-        if os.path.isdir(p) and os.path.exists(os.path.join(p, "config.json")):
-            out.append(p)
-    return out
-
-
-def _basename_no_ext(path: str) -> str:
-    b = os.path.basename(path)
-    return os.path.splitext(b)[0]
-
-
-def _cuda_sync_if_needed(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
-# =============================================================================
-# Fixed evaluator: MNISTFeatureNet (your pretrained)
-# =============================================================================
+# ============================================================
+# Feature net (fixed evaluator)
+# ============================================================
 class MNISTFeatureNet(nn.Module):
-    def __init__(self, feat_dim: int = 128):
+    def __init__(self, feat_dim=128):
         super().__init__()
         self.conv1 = nn.Conv2d(1, 32, 3, padding=1)
         self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
         self.fc1 = nn.Linear(64 * 7 * 7, feat_dim)
         self.fc2 = nn.Linear(feat_dim, 10)
 
-    def forward(self, x: torch.Tensor, return_features: bool = False):
+    def forward(self, x, return_features=False):
         x = F.relu(self.conv1(x))
-        x = F.max_pool2d(x, 2)  # 28->14
+        x = F.max_pool2d(x, 2)
         x = F.relu(self.conv2(x))
-        x = F.max_pool2d(x, 2)  # 14->7
+        x = F.max_pool2d(x, 2)
         x = x.view(x.size(0), -1)
         feats = F.relu(self.fc1(x))
         logits = self.fc2(feats)
@@ -113,224 +75,20 @@ class MNISTFeatureNet(nn.Module):
         return logits
 
 
-def load_feature_net(ckpt_path: str, device: torch.device, feat_dim: int = 128) -> MNISTFeatureNet:
+def load_feature_net(ckpt_path: str, device: torch.device) -> MNISTFeatureNet:
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    net = MNISTFeatureNet(feat_dim=feat_dim)
-    state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-    net.load_state_dict(state)
+    net = MNISTFeatureNet(feat_dim=128)
+    net.load_state_dict(ckpt["state_dict"] if "state_dict" in ckpt else ckpt)
     net.to(device).eval()
-    print(f"Loaded feature net from: {ckpt_path}")
+    print(f"[OK] Loaded MNISTFeatureNet: {ckpt_path}")
     return net
 
 
-@torch.no_grad()
-def compute_or_load_real_features(
-    feat_net: MNISTFeatureNet,
-    data_dir: str,
-    device: torch.device,
-    out_dir: str,
-    n_val: int = 10_000,
-    seed: int = 123,
-    batch_size: int = 256,
-    num_workers: int = 2,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Returns:
-      feat_real: [n_val, feat_dim] CPU
-      fixed_x12: [12,1,28,28] CPU (deterministic from the fixed val split)
-    """
-    _ensure_dir(out_dir)
-    cache_path = os.path.join(out_dir, "mnist_real_features.pt")
-
-    transform = transforms.ToTensor()
-    full = datasets.MNIST(data_dir, train=True, download=True, transform=transform)
-    n_train = len(full) - n_val
-    _, ds_val = random_split(full, [n_train, n_val], generator=torch.Generator().manual_seed(seed))
-
-    dl_val12 = DataLoader(ds_val, batch_size=12, shuffle=False, num_workers=num_workers, pin_memory=True)
-    fixed_x12, _ = next(iter(dl_val12))
-    fixed_x12 = fixed_x12.cpu()
-
-    if os.path.exists(cache_path):
-        ck = torch.load(cache_path, map_location="cpu")
-        return ck["feat_real"], fixed_x12
-
-    dl_val = DataLoader(ds_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    feats = []
-    feat_net.eval()
-    for x, _ in dl_val:
-        x = x.to(device)
-        _, f = feat_net(x, return_features=True)
-        feats.append(f.detach().cpu())
-    feat_real = torch.cat(feats, dim=0)
-
-    torch.save({"feat_real": feat_real, "n_val": n_val, "seed": seed}, cache_path)
-    print(f"Saved real MNIST features cache to: {cache_path}")
-    return feat_real, fixed_x12
-
-
-# =============================================================================
-# Metrics
-# =============================================================================
-@torch.no_grad()
-def classifier_metrics(
-    feat_net: MNISTFeatureNet,
-    images: torch.Tensor,  # [N,1,28,28] CPU in [0,1]
-    device: torch.device,
-    validity_thresh: float = 0.9,
-    batch_size: int = 512,
-) -> Dict[str, Any]:
-    feat_net.eval()
-    N = images.size(0)
-
-    preds, confs, feats = [], [], []
-    for i in range(0, N, batch_size):
-        x = images[i:i + batch_size].to(device)
-        logits, feat = feat_net(x, return_features=True)
-        prob = F.softmax(logits, dim=1)
-        conf, pred = prob.max(dim=1)
-        preds.append(pred.detach().cpu())
-        confs.append(conf.detach().cpu())
-        feats.append(feat.detach().cpu())
-
-    preds = torch.cat(preds, dim=0)
-    confs = torch.cat(confs, dim=0)
-    feats = torch.cat(feats, dim=0)
-
-    counts = torch.bincount(preds, minlength=10).float()
-    p = counts / counts.sum().clamp(min=1.0)
-    entropy = float(-(p * (p + 1e-12).log()).sum().item())  # nats
-
-    valid_mask = confs >= validity_thresh
-    validity = float(valid_mask.float().mean().item())
-    unique_digits = int(torch.unique(preds[valid_mask]).numel()) if valid_mask.any() else 0
-
-    return {
-        "validity": validity,
-        "mean_conf": float(confs.mean().item()),
-        "counts": counts.numpy(),
-        "label_entropy_nats": entropy,
-        "unique_digits": unique_digits,
-        "features": feats,  # CPU
-    }
-
-
-def _cov(x: torch.Tensor) -> torch.Tensor:
-    n = x.size(0)
-    return (x.T @ x) / max(1, (n - 1))
-
-
-def fid_from_features(feat_real: torch.Tensor, feat_gen: torch.Tensor, eps: float = 1e-6) -> float:
-    feat_real = feat_real.float()
-    feat_gen = feat_gen.float()
-
-    m1 = feat_real.mean(dim=0)
-    m2 = feat_gen.mean(dim=0)
-
-    x1 = feat_real - m1
-    x2 = feat_gen - m2
-
-    C1 = _cov(x1) + eps * torch.eye(x1.size(1))
-    C2 = _cov(x2) + eps * torch.eye(x2.size(1))
-
-    s1, U1 = torch.linalg.eigh(C1)
-    s1 = torch.clamp(s1, min=0.0)
-    sqrtC1 = (U1 * torch.sqrt(s1).unsqueeze(0)) @ U1.T
-
-    M = sqrtC1 @ C2 @ sqrtC1
-    sM, _ = torch.linalg.eigh(M)
-    sM = torch.clamp(sM, min=0.0)
-    trace_sqrt = torch.sum(torch.sqrt(sM))
-
-    fid = torch.sum((m1 - m2) ** 2) + torch.trace(C1) + torch.trace(C2) - 2.0 * trace_sqrt
-    return float(fid.item())
-
-
-# =============================================================================
-# Latent sampling helpers
-# =============================================================================
-@torch.no_grad()
-def generate_vae_prior_samples(vae: BetaVAE, device: torch.device, n: int, batch_size: int = 512) -> torch.Tensor:
-    vae.eval()
-    out = []
-    remaining = n
-    while remaining > 0:
-        b = min(batch_size, remaining)
-        z = torch.randn(b, vae.latent_dim, device=device)
-        imgs = vae.decode(z).detach().cpu()
-        out.append(imgs)
-        remaining -= b
-    return torch.cat(out, dim=0)
-
-
-@torch.no_grad()
-def decode_scaled_latents(
-    vae: BetaVAE,
-    z_scaled: torch.Tensor,  # [N,d] on device
-    mean: torch.Tensor,      # [d] CPU
-    std: torch.Tensor,       # [d] CPU
-    device: torch.device,
-) -> torch.Tensor:
-    vae.eval()
-    mean = mean.to(device)
-    std = std.to(device)
-    z = z_scaled * std + mean
-    return vae.decode(z).detach().cpu()
-
-
-# =============================================================================
-# Quickcheck figures (separate PDFs)
-# =============================================================================
-@torch.no_grad()
-def fig_recon_2xN(vae: BetaVAE, x_cpu: torch.Tensor, device: torch.device, title: str) -> plt.Figure:
-    """
-    2 rows × N cols: top originals, bottom reconstructions (deterministic via mu).
-    """
-    vae.eval()
-    x = x_cpu.to(device)
-    logits, mu, logvar, z = vae(x, sample_latent=False)
-    x_hat = torch.sigmoid(logits).detach().cpu()
-
-    n = x_cpu.size(0)
-    fig, axes = plt.subplots(2, n, figsize=(1.2 * n, 2.8))
-    if n == 1:
-        axes = np.array([[axes[0]], [axes[1]]])
-
-    for i in range(n):
-        axes[0, i].imshow(x_cpu[i, 0], cmap="gray")
-        axes[0, i].axis("off")
-        axes[1, i].imshow(x_hat[i, 0], cmap="gray")
-        axes[1, i].axis("off")
-
-    axes[0, 0].set_title("Original", fontsize=10)
-    axes[1, 0].set_title("Reconstruction", fontsize=10)
-    fig.suptitle(title)
-    fig.tight_layout()
-    return fig
-
-
-@torch.no_grad()
-def fig_images_1xN(imgs_cpu: torch.Tensor, title: str) -> plt.Figure:
-    """
-    1 row × N cols grid.
-    """
-    n = imgs_cpu.size(0)
-    fig, axes = plt.subplots(1, n, figsize=(1.2 * n, 1.4))
-    if n == 1:
-        axes = [axes]
-    for i in range(n):
-        axes[i].imshow(imgs_cpu[i, 0], cmap="gray")
-        axes[i].axis("off")
-    fig.suptitle(title)
-    fig.tight_layout()
-    return fig
-
-
-# =============================================================================
-# Pixel-space models (baseline DDPM + Flow Matching)
-# =============================================================================
+# ============================================================
+# Pixel-space model defs (baseline DDPM + Flow Matching)
+# (must match the architectures used to TRAIN those checkpoints)
+# ============================================================
 class GaussianFourierProjection(nn.Module):
-    """Gaussian random features for encoding time steps."""
     def __init__(self, embed_dim, scale=30.0):
         super().__init__()
         self.W = nn.Parameter(torch.randn(embed_dim // 2) * scale, requires_grad=False)
@@ -343,7 +101,6 @@ class GaussianFourierProjection(nn.Module):
 
 
 class Dense(nn.Module):
-    """A fully connected layer that reshapes outputs to feature maps."""
     def __init__(self, input_dim, output_dim):
         super().__init__()
         self.dense = nn.Linear(input_dim, output_dim)
@@ -353,7 +110,6 @@ class Dense(nn.Module):
 
 
 class ScoreNet(nn.Module):
-    """Time-dependent score model built upon U-Net architecture."""
     def __init__(self, marginal_prob_std, channels=(32, 64, 128, 256), embed_dim=256):
         super().__init__()
         self.marginal_prob_std = marginal_prob_std
@@ -364,7 +120,6 @@ class ScoreNet(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
 
-        # Encoder
         self.conv1 = nn.Conv2d(1, channels[0], 3, stride=1, bias=False)
         self.dense1 = Dense(embed_dim, channels[0])
         self.gnorm1 = nn.GroupNorm(4, num_channels=channels[0])
@@ -381,7 +136,6 @@ class ScoreNet(nn.Module):
         self.dense4 = Dense(embed_dim, channels[3])
         self.gnorm4 = nn.GroupNorm(32, num_channels=channels[3])
 
-        # Decoder
         self.tconv4 = nn.ConvTranspose2d(channels[3], channels[2], 3, stride=2, bias=False)
         self.dense5 = Dense(embed_dim, channels[2])
         self.tgnorm4 = nn.GroupNorm(32, num_channels=channels[2])
@@ -403,7 +157,6 @@ class ScoreNet(nn.Module):
     def forward(self, x, t):
         if t.dim() != 1:
             t = t.view(-1)
-
         embed = self.act(self.embed(t))
 
         h1 = self.conv1(x)
@@ -440,7 +193,6 @@ class ScoreNet(nn.Module):
 
 
 class DDPM(nn.Module):
-    """Baseline DDPM wrapper (flat 784)."""
     def __init__(self, network, T=1000, beta_1=1e-4, beta_T=2e-2):
         super().__init__()
         self._network = network
@@ -454,6 +206,11 @@ class DDPM(nn.Module):
         self.register_buffer("beta", torch.linspace(beta_1, beta_T, T + 1))
         self.register_buffer("alpha", 1.0 - self.beta)
         self.register_buffer("alpha_bar", self.alpha.cumprod(dim=0))
+
+    def forward_diffusion(self, x0, t, epsilon):
+        mean = torch.sqrt(self.alpha_bar[t]) * x0
+        std = torch.sqrt(1.0 - self.alpha_bar[t])
+        return mean + std * epsilon
 
     def reverse_diffusion(self, xt, t, epsilon):
         mean = (1.0 / torch.sqrt(self.alpha[t])) * (
@@ -477,7 +234,6 @@ class DDPM(nn.Module):
 
 
 class RectifiedFlow(nn.Module):
-    """Rectified Flow / Flow Matching (flat 784)."""
     def __init__(self, unet_backbone):
         super().__init__()
         self._net = unet_backbone
@@ -513,204 +269,403 @@ class RectifiedFlow(nn.Module):
         raise ValueError("solver must be 'euler' or 'heun'")
 
 
-def _postprocess_pixel_samples(x_flat: torch.Tensor, mode: str = "auto") -> torch.Tensor:
+# ============================================================
+# Helpers
+# ============================================================
+def _ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+def _read_json(p: str) -> Optional[Dict[str, Any]]:
+    if not os.path.exists(p):
+        return None
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def list_run_dirs(run_root: str) -> List[str]:
+    if not os.path.exists(run_root):
+        return []
+    out = []
+    for name in sorted(os.listdir(run_root)):
+        d = os.path.join(run_root, name)
+        if os.path.isdir(d) and os.path.exists(os.path.join(d, "config.json")):
+            out.append(d)
+    return out
+
+
+def _cuda_sync(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def time_it(device: torch.device, fn):
+    _cuda_sync(device)
+    t0 = time.perf_counter()
+    out = fn()
+    _cuda_sync(device)
+    return out, (time.perf_counter() - t0)
+
+
+# ============================================================
+# Postprocessing for pixel outputs (CRITICAL FIX)
+# ============================================================
+@torch.no_grad()
+def flat_to_img01(x_flat: torch.Tensor, mode: str = "auto") -> torch.Tensor:
     """
-    x_flat: [N,784] on device
-    returns: [N,1,28,28] CPU in [0,1]
+    x_flat: [B,784] (often in [-1,1] for your pixel models)
+    return : [B,1,28,28] on CPU in [0,1]
     mode:
-      - "auto": if values look like [-1,1] -> map to [0,1], else clamp [0,1]
-      - "0_1": clamp to [0,1]
-      - "minus1_1": map (x+1)/2 then clamp
+      - "minus1_1": assume x in [-1,1]
+      - "0_1": assume x in [0,1]
+      - "auto": detect by min/max
     """
-    x = x_flat.detach()
+    x = x_flat.view(-1, 1, 28, 28).float()
+
     if mode == "minus1_1":
         x = (x + 1.0) * 0.5
-        x = x.clamp(0.0, 1.0)
     elif mode == "0_1":
-        x = x.clamp(0.0, 1.0)
+        x = x
     else:
-        # auto
         xmin = float(x.min().item())
         xmax = float(x.max().item())
-        if (xmin < -0.1) and (xmax <= 1.2) and (xmin >= -1.2):
+        if xmin < -0.05:
             x = (x + 1.0) * 0.5
-        x = x.clamp(0.0, 1.0)
 
-    x = x.view(-1, 1, 28, 28).cpu()
-    return x
+    return x.clamp(0.0, 1.0).cpu()
 
 
-def load_pixel_baseline_ddpm(
-    ckpt_path: str,
+# ============================================================
+# Metrics: classifier + FID(feature)
+# ============================================================
+@torch.no_grad()
+def classifier_metrics(
+    clf: MNISTFeatureNet,
+    images01: torch.Tensor,  # [N,1,28,28] CPU [0,1]
     device: torch.device,
-    T: Optional[int] = None,
-    beta_1: Optional[float] = None,
-    beta_T: Optional[float] = None,
-) -> DDPM:
-    payload = torch.load(ckpt_path, map_location="cpu")
+    validity_thresh: float = 0.9,
+    batch_size: int = 512,
+) -> Dict[str, Any]:
+    clf.eval()
+    N = images01.size(0)
 
-    # try to get config from checkpoint if present
-    cfg = payload.get("cfg", {}) if isinstance(payload, dict) else {}
-    T = int(T if T is not None else cfg.get("T", 1000))
-    beta_1 = float(beta_1 if beta_1 is not None else cfg.get("beta_1", 1e-4))
-    beta_T = float(beta_T if beta_T is not None else cfg.get("beta_T", 2e-2))
+    preds, confs, feats = [], [], []
+    for i in range(0, N, batch_size):
+        x = images01[i:i + batch_size].to(device)
+        logits, feat = clf(x, return_features=True)
+        prob = F.softmax(logits, dim=1)
+        conf, pred = prob.max(dim=1)
+        preds.append(pred.detach().cpu())
+        confs.append(conf.detach().cpu())
+        feats.append(feat.detach().cpu())
 
-    unet = ScoreNet(marginal_prob_std=lambda t: torch.ones_like(t).to(device))
-    model = DDPM(unet, T=T, beta_1=beta_1, beta_T=beta_T).to(device)
+    preds = torch.cat(preds, dim=0)
+    confs = torch.cat(confs, dim=0)
+    feats = torch.cat(feats, dim=0)
 
-    # load EMA if available
-    if isinstance(payload, dict) and "ema_state_dict" in payload:
-        model.load_state_dict(payload["ema_state_dict"])
-    elif isinstance(payload, dict) and "state_dict" in payload:
-        model.load_state_dict(payload["state_dict"])
-    else:
-        model.load_state_dict(payload)
+    counts = torch.bincount(preds, minlength=10).float()
+    unique_digits = int((counts > 0).sum().item())
 
-    model.eval()
-    print(f"Loaded pixel baseline DDPM: {ckpt_path} (T={T}, beta_1={beta_1}, beta_T={beta_T})")
-    return model
+    p = counts / counts.sum().clamp(min=1.0)
+    entropy = float(-(p * (p + 1e-12).log()).sum().item())
+
+    return {
+        "validity": float((confs >= validity_thresh).float().mean().item()),
+        "mean_conf": float(confs.mean().item()),
+        "unique_digits": unique_digits,
+        "label_entropy_nats": entropy,
+        "counts": counts.numpy(),
+        "features": feats,  # CPU
+    }
 
 
-def load_pixel_flow_matching(
-    ckpt_path: str,
+def _cov(x: torch.Tensor) -> torch.Tensor:
+    n = x.size(0)
+    return (x.T @ x) / max(1, (n - 1))
+
+
+def fid_from_features(feat_real: torch.Tensor, feat_gen: torch.Tensor, eps: float = 1e-6) -> float:
+    feat_real = feat_real.float()
+    feat_gen = feat_gen.float()
+
+    m1 = feat_real.mean(dim=0)
+    m2 = feat_gen.mean(dim=0)
+    x1 = feat_real - m1
+    x2 = feat_gen - m2
+
+    C1 = _cov(x1) + eps * torch.eye(x1.size(1))
+    C2 = _cov(x2) + eps * torch.eye(x2.size(1))
+
+    s1, U1 = torch.linalg.eigh(C1)
+    s1 = torch.clamp(s1, min=0.0)
+    sqrtC1 = (U1 * torch.sqrt(s1).unsqueeze(0)) @ U1.T
+
+    M = sqrtC1 @ C2 @ sqrtC1
+    sM, _ = torch.linalg.eigh(M)
+    sM = torch.clamp(sM, min=0.0)
+    trace_sqrt = torch.sum(torch.sqrt(sM))
+
+    fid = torch.sum((m1 - m2) ** 2) + torch.trace(C1) + torch.trace(C2) - 2.0 * trace_sqrt
+    return float(fid.item())
+
+
+# ============================================================
+# Plot + quickcheck writers
+# ============================================================
+def save_gen_quickcheck_pdf(images01: torch.Tensor, pdf_path: str, title: str, cols: int = 12) -> None:
+    n = min(cols, images01.size(0))
+    fig, axes = plt.subplots(1, n, figsize=(1.3 * n, 1.6))
+    if n == 1:
+        axes = [axes]
+    for i in range(n):
+        axes[i].imshow(images01[i, 0].cpu(), cmap="gray")
+        axes[i].axis("off")
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(pdf_path, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_recon_quickcheck_pdf(x01: torch.Tensor, xhat01: torch.Tensor, pdf_path: str, title: str, cols: int = 12) -> None:
+    n = min(cols, x01.size(0), xhat01.size(0))
+    fig, axes = plt.subplots(2, n, figsize=(1.3 * n, 3.2))
+    for i in range(n):
+        axes[0, i].imshow(x01[i, 0].cpu(), cmap="gray")
+        axes[0, i].axis("off")
+        axes[1, i].imshow(xhat01[i, 0].cpu(), cmap="gray")
+        axes[1, i].axis("off")
+    axes[0, 0].set_title("Original", fontsize=10)
+    axes[1, 0].set_title("Reconstruction", fontsize=10)
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(pdf_path, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_summary_csv(rows: List[Dict[str, Any]], path: str) -> None:
+    if not rows:
+        return
+    cols = list(rows[0].keys())
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(",".join(cols) + "\n")
+        for r in rows:
+            f.write(",".join(str(r.get(c, "")) for c in cols) + "\n")
+    print(f"[OK] Saved: {path}")
+
+
+def save_label_histograms_pdf(label_hists: List[Tuple[np.ndarray, str]], path: str) -> None:
+    with PdfPages(path) as pdf:
+        for counts, title in label_hists:
+            fig, ax = plt.subplots(figsize=(7, 4))
+            ax.bar(list(range(10)), counts)
+            ax.set_xlabel("Predicted label")
+            ax.set_ylabel("Count")
+            ax.set_title(title)
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+    print(f"[OK] Saved: {path}")
+
+
+def save_fid_bar_pdf(fid_points: List[Tuple[float, str]], path: str) -> None:
+    fid_sorted = sorted(fid_points, key=lambda t: t[0])
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ax.bar([n for _, n in fid_sorted], [v for v, _ in fid_sorted])
+    ax.set_ylabel("MNIST-FID (feature space)")
+    ax.set_title("Lower is better")
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    fig.savefig(path, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] Saved: {path}")
+
+
+def save_scatter_pdf(val_points: List[Tuple[float, float, str]], path: str, validity_thresh: float) -> None:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for v, c, label in val_points:
+        ax.scatter(v, c, s=35)
+        ax.annotate(label, (v, c), fontsize=7, alpha=0.9)
+    ax.set_xlabel(f"Validity (P(max) ≥ {validity_thresh})")
+    ax.set_ylabel("Mean confidence")
+    ax.set_title("Sample quality (classifier-based)")
+    fig.tight_layout()
+    fig.savefig(path, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] Saved: {path}")
+
+
+def save_sampling_time_pdf(time_points: List[Tuple[float, str]], path: str) -> None:
+    t_sorted = sorted(time_points, key=lambda t: t[0])
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ax.bar([n for _, n in t_sorted], [v for v, _ in t_sorted])
+    ax.set_ylabel("Sampling time (s) for n_gen samples")
+    ax.set_title("Lower is faster")
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    fig.savefig(path, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] Saved: {path}")
+
+
+# ============================================================
+# Real features (CRITICAL: use [0,1] MNIST, not your dequant/flatten)
+# ============================================================
+@torch.no_grad()
+def compute_real_features(
+    clf: MNISTFeatureNet,
+    data_dir: str,
     device: torch.device,
-) -> RectifiedFlow:
-    payload = torch.load(ckpt_path, map_location="cpu")
-    unet = ScoreNet(marginal_prob_std=lambda t: torch.ones_like(t).to(device))
-    model = RectifiedFlow(unet).to(device)
+    n_val: int = 10_000,
+    batch_size: int = 256,
+    num_workers: int = 2,
+) -> torch.Tensor:
+    eval_tf = transforms.ToTensor()  # [0,1], [1,28,28]
+    full = datasets.MNIST(data_dir, train=True, download=True, transform=eval_tf)
+    n_train = len(full) - n_val
+    _, ds_val = random_split(full, [n_train, n_val], generator=torch.Generator().manual_seed(123))
+    dl = DataLoader(ds_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    if isinstance(payload, dict) and "state_dict" in payload:
-        model.load_state_dict(payload["state_dict"])
-    else:
-        model.load_state_dict(payload)
+    feats = []
+    clf.eval()
+    for x, _ in dl:
+        x = x.to(device)
+        _, f = clf(x, return_features=True)
+        feats.append(f.detach().cpu())
+    return torch.cat(feats, dim=0)
 
-    model.eval()
-    print(f"Loaded pixel Flow Matching: {ckpt_path}")
-    return model
 
-
-# =============================================================================
-# Main evaluator: latent runs + optional pixel models
-# =============================================================================
+# ============================================================
+# Main: evaluate everything
+# ============================================================
 def evaluate_all_models(
     run_root: str,
     out_dir: str,
     data_dir: str,
     device: torch.device,
-    feature_net_ckpt: str = "mnist_feature_net.pt",
-    # Pixel models (optional)
+    feature_net_ckpt: str,
     pixel_ckpt_dir: Optional[str] = None,
-    baseline_ckpt_name: Optional[str] = None,
-    flow_ckpt_name: Optional[str] = None,
-    pixel_output_mode: str = "auto",  # "auto" | "0_1" | "minus1_1"
-    baseline_T: Optional[int] = None,
-    baseline_beta_1: Optional[float] = None,
-    baseline_beta_T: Optional[float] = None,
-    flow_steps: int = 100,
-    flow_solver: str = "heun",
-    # common
+    baseline_ckpt_name: str = "baseline_ddpm_ema.pt",
+    flow_ckpt_name: str = "flow_matching.pt",
+    pixel_output_mode: str = "auto",  # auto | 0_1 | minus1_1
     n_gen: int = 5000,
     validity_thresh: float = 0.9,
+    batch_size: int = 256,
     num_workers: int = 2,
-    seed_sampling: int = 0,
     quickcheck: bool = True,
     quickcheck_cols: int = 12,
 ) -> List[Dict[str, Any]]:
+    """
+    Returns:
+      rows: list of dicts (also saved to out_dir/summary.csv)
+
+    Notes on "Sampling time (s)":
+      This is the TOTAL wall time to generate n_gen samples (not per-sample).
+    """
     _ensure_dir(out_dir)
-    qc_dir = os.path.join(out_dir, "quickcheck")
-    _ensure_dir(qc_dir)
 
-    feat_net = load_feature_net(feature_net_ckpt, device=device, feat_dim=128)
-    feat_real, fixed_x12 = compute_or_load_real_features(
-        feat_net=feat_net,
-        data_dir=data_dir,
-        device=device,
-        out_dir=out_dir,
-        n_val=10_000,
-        seed=123,
-        batch_size=256,
-        num_workers=num_workers,
-    )
-
-    # deterministic sampling
-    torch.manual_seed(seed_sampling)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed_sampling)
+    clf = load_feature_net(feature_net_ckpt, device)
+    feat_real = compute_real_features(clf, data_dir, device, n_val=10_000, batch_size=256, num_workers=num_workers)
+    print("[OK] Real features:", tuple(feat_real.shape))
 
     rows: List[Dict[str, Any]] = []
     label_hists: List[Tuple[np.ndarray, str]] = []
     fid_points: List[Tuple[float, str]] = []
     val_points: List[Tuple[float, float, str]] = []
+    time_points: List[Tuple[float, str]] = []
 
-    # -------------------------------------------------------------------------
-    # (A) Latent diffusion runs
-    # -------------------------------------------------------------------------
-    run_dirs = list_diffusion_runs(run_root)
+    # ------------------------------------------------------------
+    # A) Evaluate latent diffusion runs in run_root
+    # ------------------------------------------------------------
+    run_dirs = list_run_dirs(run_root)
+    if not run_dirs:
+        print(f"[WARN] No diffusion runs found in: {run_root}")
+
+    # fixed images for recon quickcheck (VAE side)
+    recon_x01 = None
+    if quickcheck:
+        eval_tf = transforms.ToTensor()
+        ds = datasets.MNIST(data_dir, train=True, download=True, transform=eval_tf)
+        dl_tmp = DataLoader(ds, batch_size=64, shuffle=True, num_workers=num_workers)
+        x01, _ = next(iter(dl_tmp))
+        recon_x01 = x01[:quickcheck_cols].to(device)
+
     for ddir in run_dirs:
-        name = os.path.basename(ddir)
+        run_name = os.path.basename(ddir)
         cfg = _read_json(os.path.join(ddir, "config.json")) or {}
         vae_run_dir = cfg.get("vae_run_dir", None)
         if vae_run_dir is None:
-            print(f"[Skip] {name}: missing vae_run_dir in config.json")
+            print(f"[Skip] {run_name}: missing vae_run_dir in config.json")
+            continue
+
+        latent_path = os.path.join(ddir, "latents", "mnist_latents_mu.pt")
+        if not os.path.exists(latent_path):
+            print(f"[Skip] {run_name}: missing {latent_path}")
             continue
 
         ddpm_path = os.path.join(ddir, "models", "ddpm.pt")
         cont_path = os.path.join(ddir, "models", "cont.pt")
-        latent_path = os.path.join(ddir, "latents", "mnist_latents_mu.pt")
-        if not os.path.exists(latent_path):
-            print(f"[Skip] {name}: missing latents/mnist_latents_mu.pt")
-            continue
 
-        vae = load_vae_from_run(vae_run_dir, device=device)
+        # Load VAE and latent stats
+        vae = load_vae_from_run(vae_run_dir, device=device)  # your exact loader
         latent_ckpt = load_latent_checkpoint(latent_path)
         mean = latent_ckpt["mean"]
         std = latent_ckpt["std"]
         latent_dim = int(latent_ckpt["meta"]["latent_dim"])
 
-        # quickcheck recon: 2 rows × 12
-        if quickcheck:
-            xN = fixed_x12[:quickcheck_cols].cpu()
-            recon_pdf = os.path.join(qc_dir, f"{name}__recon_2x{quickcheck_cols}.pdf")
-            fig = fig_recon_2xN(vae, xN, device=device, title=f"{name} — Recon (original + recon)")
-            fig.savefig(recon_pdf, format="pdf", bbox_inches="tight")
-            plt.close(fig)
+        # ----- recon quickcheck (once per run: VAE recon)
+        if quickcheck and recon_x01 is not None:
+            with torch.no_grad():
+                # assume VAE expects [0,1]
+                logits, mu, logvar, z = vae(recon_x01, sample_latent=False)
+                xhat01 = torch.sigmoid(logits).clamp(0, 1).detach().cpu()
+            pdf_path = os.path.join(out_dir, f"quickcheck_recon__{run_name}.pdf")
+            save_recon_quickcheck_pdf(
+                recon_x01.detach().cpu(), xhat01, pdf_path,
+                title=f"VAE reconstruction — {run_name}", cols=quickcheck_cols
+            )
 
-        # ---- vae_prior
-        _cuda_sync_if_needed(device)
-        t0 = time.perf_counter()
-        imgs_vae = generate_vae_prior_samples(vae, device=device, n=n_gen)
-        _cuda_sync_if_needed(device)
-        sampling_time = time.perf_counter() - t0
+        # ============ 1) VAE prior ============
+        def sample_vae_prior() -> torch.Tensor:
+            outs = []
+            remaining = n_gen
+            while remaining > 0:
+                b = min(batch_size, remaining)
+                z = torch.randn(b, latent_dim, device=device)
+                imgs = vae.decode(z).detach().cpu()  # [0,1]
+                outs.append(imgs)
+                remaining -= b
+            return torch.cat(outs, dim=0)
 
-        m = classifier_metrics(feat_net, imgs_vae, device=device, validity_thresh=validity_thresh)
+        imgs_vae, t_vae = time_it(device, sample_vae_prior)
+        m = classifier_metrics(clf, imgs_vae, device=device, validity_thresh=validity_thresh)
         fid = fid_from_features(feat_real, m["features"])
 
-        label = f"{name} :: vae_prior"
+        label = f"{run_name}::vae_prior"
         rows.append({
-            "run_name": name,
-            "space": "latent",
+            "run_name": run_name,
             "model_type": "vae_prior",
             "latent_dim": latent_dim,
-            "mnist_fid": fid,
-            "mean_conf": m["mean_conf"],
-            "unique_digits": m["unique_digits"],
-            "sampling_time_s": float(sampling_time),
-            "gen_validity": m["validity"],
-            "gen_label_entropy_nats": m["label_entropy_nats"],
+            "MNIST-FID": fid,
+            "Mean conf.": m["mean_conf"],
+            "Unique digits": m["unique_digits"],
+            "Sampling time (s)": t_vae,
+            "validity@thr": m["validity"],
+            "label_entropy_nats": m["label_entropy_nats"],
         })
         label_hists.append((m["counts"], label))
         fid_points.append((fid, label))
         val_points.append((m["validity"], m["mean_conf"], label))
+        time_points.append((t_vae, label))
 
         if quickcheck:
-            gen_pdf = os.path.join(qc_dir, f"{name}__gen__vae_prior_1x{quickcheck_cols}.pdf")
-            fig = fig_images_1xN(imgs_vae[:quickcheck_cols].cpu(), title=f"{name} — Generated (vae_prior)")
-            fig.savefig(gen_pdf, format="pdf", bbox_inches="tight")
-            plt.close(fig)
+            save_gen_quickcheck_pdf(
+                imgs_vae, os.path.join(out_dir, f"quickcheck_gen__{run_name}__vae_prior.pdf"),
+                title=f"Generated — {label}", cols=quickcheck_cols
+            )
 
-        print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={sampling_time:.2f}s")
+        print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={t_vae:.2f}s")
 
-        # ---- ddpm
+        # ============ 2) Latent DDPM ============
         if os.path.exists(ddpm_path):
             ddpm_ckpt = torch.load(ddpm_path, map_location=device)
             den = LatentDenoiser(
@@ -725,44 +680,45 @@ def evaluate_all_models(
             T = int(cfg.get("ddpm_T", ddpm_ckpt.get("cfg", {}).get("ddpm_T", 200)))
             ddpm = LatentDDPM(den, latent_dim=latent_dim, T=T, device=device)
 
-            _cuda_sync_if_needed(device)
-            t0 = time.perf_counter()
-            z_scaled = ddpm.sample(n_gen)
-            imgs = decode_scaled_latents(vae, z_scaled, mean, std, device=device)
-            _cuda_sync_if_needed(device)
-            sampling_time = time.perf_counter() - t0
+            def sample_latent_ddpm() -> torch.Tensor:
+                # sample in "scaled space" (like your training), then unscale and decode
+                z_scaled = ddpm.sample(n_gen)  # [N,d] on device
+                z = z_scaled * std.to(device) + mean.to(device)
+                imgs = vae.decode(z).detach().cpu()
+                return imgs
 
-            m = classifier_metrics(feat_net, imgs, device=device, validity_thresh=validity_thresh)
+            imgs, t_ddpm = time_it(device, sample_latent_ddpm)
+            m = classifier_metrics(clf, imgs, device=device, validity_thresh=validity_thresh)
             fid = fid_from_features(feat_real, m["features"])
-            label = f"{name} :: ddpm"
 
+            label = f"{run_name}::ddpm"
             rows.append({
-                "run_name": name,
-                "space": "latent",
+                "run_name": run_name,
                 "model_type": "ddpm",
                 "latent_dim": latent_dim,
-                "mnist_fid": fid,
-                "mean_conf": m["mean_conf"],
-                "unique_digits": m["unique_digits"],
-                "sampling_time_s": float(sampling_time),
-                "gen_validity": m["validity"],
-                "gen_label_entropy_nats": m["label_entropy_nats"],
+                "MNIST-FID": fid,
+                "Mean conf.": m["mean_conf"],
+                "Unique digits": m["unique_digits"],
+                "Sampling time (s)": t_ddpm,
+                "validity@thr": m["validity"],
+                "label_entropy_nats": m["label_entropy_nats"],
             })
             label_hists.append((m["counts"], label))
             fid_points.append((fid, label))
             val_points.append((m["validity"], m["mean_conf"], label))
+            time_points.append((t_ddpm, label))
 
             if quickcheck:
-                gen_pdf = os.path.join(qc_dir, f"{name}__gen__ddpm_1x{quickcheck_cols}.pdf")
-                fig = fig_images_1xN(imgs[:quickcheck_cols].cpu(), title=f"{name} — Generated (ddpm)")
-                fig.savefig(gen_pdf, format="pdf", bbox_inches="tight")
-                plt.close(fig)
+                save_gen_quickcheck_pdf(
+                    imgs, os.path.join(out_dir, f"quickcheck_gen__{run_name}__ddpm.pdf"),
+                    title=f"Generated — {label}", cols=quickcheck_cols
+                )
 
-            print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={sampling_time:.2f}s")
+            print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={t_ddpm:.2f}s")
         else:
-            print(f"[Warn] {name}: missing models/ddpm.pt")
+            print(f"[Warn] {run_name}: missing models/ddpm.pt")
 
-        # ---- cont
+        # ============ 3) Continuous VP-SDE ============
         if os.path.exists(cont_path):
             cont_ckpt = torch.load(cont_path, map_location=device)
             den = LatentDenoiser(
@@ -780,191 +736,170 @@ def evaluate_all_models(
 
             steps = int(cfg.get("sample_steps_cont", cont_ckpt.get("cfg", {}).get("sample_steps_cont", 200)))
 
-            _cuda_sync_if_needed(device)
-            t0 = time.perf_counter()
-            z_scaled = cont.sample(n_gen, steps=steps)
-            imgs = decode_scaled_latents(vae, z_scaled, mean, std, device=device)
-            _cuda_sync_if_needed(device)
-            sampling_time = time.perf_counter() - t0
+            def sample_latent_cont() -> torch.Tensor:
+                z_scaled = cont.sample(n_gen, steps=steps)  # [N,d]
+                z = z_scaled * std.to(device) + mean.to(device)
+                imgs = vae.decode(z).detach().cpu()
+                return imgs
 
-            m = classifier_metrics(feat_net, imgs, device=device, validity_thresh=validity_thresh)
+            imgs, t_cont = time_it(device, sample_latent_cont)
+            m = classifier_metrics(clf, imgs, device=device, validity_thresh=validity_thresh)
             fid = fid_from_features(feat_real, m["features"])
-            label = f"{name} :: cont"
 
+            label = f"{run_name}::cont"
             rows.append({
-                "run_name": name,
-                "space": "latent",
+                "run_name": run_name,
                 "model_type": "cont",
                 "latent_dim": latent_dim,
-                "mnist_fid": fid,
-                "mean_conf": m["mean_conf"],
-                "unique_digits": m["unique_digits"],
-                "sampling_time_s": float(sampling_time),
-                "gen_validity": m["validity"],
-                "gen_label_entropy_nats": m["label_entropy_nats"],
+                "MNIST-FID": fid,
+                "Mean conf.": m["mean_conf"],
+                "Unique digits": m["unique_digits"],
+                "Sampling time (s)": t_cont,
+                "validity@thr": m["validity"],
+                "label_entropy_nats": m["label_entropy_nats"],
             })
             label_hists.append((m["counts"], label))
             fid_points.append((fid, label))
             val_points.append((m["validity"], m["mean_conf"], label))
+            time_points.append((t_cont, label))
 
             if quickcheck:
-                gen_pdf = os.path.join(qc_dir, f"{name}__gen__cont_1x{quickcheck_cols}.pdf")
-                fig = fig_images_1xN(imgs[:quickcheck_cols].cpu(), title=f"{name} — Generated (cont)")
-                fig.savefig(gen_pdf, format="pdf", bbox_inches="tight")
-                plt.close(fig)
+                save_gen_quickcheck_pdf(
+                    imgs, os.path.join(out_dir, f"quickcheck_gen__{run_name}__cont.pdf"),
+                    title=f"Generated — {label}", cols=quickcheck_cols
+                )
 
-            print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={sampling_time:.2f}s")
+            print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={t_cont:.2f}s")
         else:
-            print(f"[Warn] {name}: missing models/cont.pt")
+            print(f"[Warn] {run_name}: missing models/cont.pt")
 
-    # -------------------------------------------------------------------------
-    # (B) Pixel models (optional)
-    # -------------------------------------------------------------------------
-    if pixel_ckpt_dir and (baseline_ckpt_name or flow_ckpt_name):
-        pixel_ckpt_dir = os.path.abspath(pixel_ckpt_dir)
+    # ------------------------------------------------------------
+    # B) Evaluate pixel-space baseline DDPM + Flow Matching
+    # ------------------------------------------------------------
+    if pixel_ckpt_dir is not None:
+        base_path = os.path.join(pixel_ckpt_dir, baseline_ckpt_name)
+        flow_path = os.path.join(pixel_ckpt_dir, flow_ckpt_name)
 
         # Baseline DDPM
-        if baseline_ckpt_name:
-            ckpt_path = os.path.join(pixel_ckpt_dir, baseline_ckpt_name)
-            model_name = _basename_no_ext(baseline_ckpt_name)
-            baseline = load_pixel_baseline_ddpm(
-                ckpt_path=ckpt_path,
-                device=device,
-                T=baseline_T,
-                beta_1=baseline_beta_1,
-                beta_T=baseline_beta_T,
-            )
+        if os.path.exists(base_path):
+            payload = torch.load(base_path, map_location="cpu")
+            # Use cfg if saved, else fall back
+            cfg = payload.get("cfg", {})
+            T = int(cfg.get("T", 1000))
+            b1 = float(cfg.get("beta_1", 1e-4))
+            bT = float(cfg.get("beta_T", 2e-2))
 
-            _cuda_sync_if_needed(device)
-            t0 = time.perf_counter()
-            x_flat = baseline.sample((n_gen, 28 * 28))
-            _cuda_sync_if_needed(device)
-            sampling_time = time.perf_counter() - t0
+            unet = ScoreNet(marginal_prob_std=lambda t: torch.ones_like(t).to(device))
+            baseline = DDPM(unet, T=T, beta_1=b1, beta_T=bT).to(device)
+            baseline.load_state_dict(payload["ema_state_dict"] if "ema_state_dict" in payload else payload["state_dict"])
+            baseline.eval()
 
-            imgs = _postprocess_pixel_samples(x_flat, mode=pixel_output_mode)
-            m = classifier_metrics(feat_net, imgs, device=device, validity_thresh=validity_thresh)
+            def sample_pixel_baseline() -> torch.Tensor:
+                outs = []
+                remaining = n_gen
+                while remaining > 0:
+                    b = min(batch_size, remaining)
+                    x_flat = baseline.sample((b, 28 * 28))
+                    outs.append(flat_to_img01(x_flat, mode=pixel_output_mode))
+                    remaining -= b
+                return torch.cat(outs, dim=0)
+
+            imgs, t_base = time_it(device, sample_pixel_baseline)
+            m = classifier_metrics(clf, imgs, device=device, validity_thresh=validity_thresh)
             fid = fid_from_features(feat_real, m["features"])
-            label = f"{model_name} :: pixel_ddpm"
 
+            run_name = f"pixel::{baseline_ckpt_name}"
+            label = run_name
             rows.append({
-                "run_name": model_name,
-                "space": "pixel",
+                "run_name": run_name,
                 "model_type": "pixel_ddpm",
-                "latent_dim": 28 * 28,
-                "mnist_fid": fid,
-                "mean_conf": m["mean_conf"],
-                "unique_digits": m["unique_digits"],
-                "sampling_time_s": float(sampling_time),
-                "gen_validity": m["validity"],
-                "gen_label_entropy_nats": m["label_entropy_nats"],
+                "latent_dim": "",
+                "MNIST-FID": fid,
+                "Mean conf.": m["mean_conf"],
+                "Unique digits": m["unique_digits"],
+                "Sampling time (s)": t_base,
+                "validity@thr": m["validity"],
+                "label_entropy_nats": m["label_entropy_nats"],
             })
             label_hists.append((m["counts"], label))
             fid_points.append((fid, label))
             val_points.append((m["validity"], m["mean_conf"], label))
+            time_points.append((t_base, label))
 
             if quickcheck:
-                gen_pdf = os.path.join(qc_dir, f"{model_name}__gen__pixel_ddpm_1x{quickcheck_cols}.pdf")
-                fig = fig_images_1xN(imgs[:quickcheck_cols].cpu(), title=f"{model_name} — Generated (pixel_ddpm)")
-                fig.savefig(gen_pdf, format="pdf", bbox_inches="tight")
-                plt.close(fig)
+                save_gen_quickcheck_pdf(
+                    imgs, os.path.join(out_dir, f"quickcheck_gen__pixel__baseline_ddpm.pdf"),
+                    title=f"Generated — {label}", cols=quickcheck_cols
+                )
 
-            print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={sampling_time:.2f}s")
+            print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={t_base:.2f}s")
+        else:
+            print(f"[Warn] Missing pixel baseline ckpt: {base_path}")
 
         # Flow Matching
-        if flow_ckpt_name:
-            ckpt_path = os.path.join(pixel_ckpt_dir, flow_ckpt_name)
-            model_name = _basename_no_ext(flow_ckpt_name)
-            flow = load_pixel_flow_matching(ckpt_path=ckpt_path, device=device)
+        if os.path.exists(flow_path):
+            payload = torch.load(flow_path, map_location="cpu")
+            unet = ScoreNet(marginal_prob_std=lambda t: torch.ones_like(t).to(device))
+            flow = RectifiedFlow(unet).to(device)
+            flow.load_state_dict(payload["state_dict"] if "state_dict" in payload else payload)
+            flow.eval()
 
-            _cuda_sync_if_needed(device)
-            t0 = time.perf_counter()
-            x_flat = flow.sample((n_gen, 28 * 28), steps=flow_steps, solver=flow_solver)
-            _cuda_sync_if_needed(device)
-            sampling_time = time.perf_counter() - t0
+            # you can tune these if you want
+            steps = 100
+            solver = "heun"
 
-            imgs = _postprocess_pixel_samples(x_flat, mode=pixel_output_mode)
-            m = classifier_metrics(feat_net, imgs, device=device, validity_thresh=validity_thresh)
+            def sample_pixel_flow() -> torch.Tensor:
+                outs = []
+                remaining = n_gen
+                while remaining > 0:
+                    b = min(batch_size, remaining)
+                    x_flat = flow.sample((b, 28 * 28), steps=steps, solver=solver)
+                    outs.append(flat_to_img01(x_flat, mode=pixel_output_mode))
+                    remaining -= b
+                return torch.cat(outs, dim=0)
+
+            imgs, t_flow = time_it(device, sample_pixel_flow)
+            m = classifier_metrics(clf, imgs, device=device, validity_thresh=validity_thresh)
             fid = fid_from_features(feat_real, m["features"])
-            label = f"{model_name} :: flow_matching"
 
+            run_name = f"pixel::{flow_ckpt_name}"
+            label = run_name
             rows.append({
-                "run_name": model_name,
-                "space": "pixel",
-                "model_type": "flow_matching",
-                "latent_dim": 28 * 28,
-                "mnist_fid": fid,
-                "mean_conf": m["mean_conf"],
-                "unique_digits": m["unique_digits"],
-                "sampling_time_s": float(sampling_time),
-                "gen_validity": m["validity"],
-                "gen_label_entropy_nats": m["label_entropy_nats"],
+                "run_name": run_name,
+                "model_type": f"pixel_flow_{steps}_{solver}",
+                "latent_dim": "",
+                "MNIST-FID": fid,
+                "Mean conf.": m["mean_conf"],
+                "Unique digits": m["unique_digits"],
+                "Sampling time (s)": t_flow,
+                "validity@thr": m["validity"],
+                "label_entropy_nats": m["label_entropy_nats"],
             })
             label_hists.append((m["counts"], label))
             fid_points.append((fid, label))
             val_points.append((m["validity"], m["mean_conf"], label))
+            time_points.append((t_flow, label))
 
             if quickcheck:
-                gen_pdf = os.path.join(qc_dir, f"{model_name}__gen__flow_matching_1x{quickcheck_cols}.pdf")
-                fig = fig_images_1xN(imgs[:quickcheck_cols].cpu(), title=f"{model_name} — Generated (flow_matching)")
-                fig.savefig(gen_pdf, format="pdf", bbox_inches="tight")
-                plt.close(fig)
+                save_gen_quickcheck_pdf(
+                    imgs, os.path.join(out_dir, f"quickcheck_gen__pixel__flow_matching.pdf"),
+                    title=f"Generated — {label}", cols=quickcheck_cols
+                )
 
-            print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={sampling_time:.2f}s")
+            print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={t_flow:.2f}s")
+        else:
+            print(f"[Warn] Missing pixel flow ckpt: {flow_path}")
 
-    # -------------------------------------------------------------------------
-    # Save summary.csv
-    # -------------------------------------------------------------------------
-    if not rows:
-        print("No models evaluated; nothing to save.")
-        return []
+    # ------------------------------------------------------------
+    # Save outputs
+    # ------------------------------------------------------------
+    if rows:
+        save_summary_csv(rows, os.path.join(out_dir, "summary.csv"))
+        save_scatter_pdf(val_points, os.path.join(out_dir, "sample_validity.pdf"), validity_thresh)
+        save_fid_bar_pdf(fid_points, os.path.join(out_dir, "fid_scores.pdf"))
+        save_sampling_time_pdf(time_points, os.path.join(out_dir, "sampling_time.pdf"))
+        save_label_histograms_pdf(label_hists, os.path.join(out_dir, "label_histograms.pdf"))
+    else:
+        print("[WARN] No rows produced; nothing to save.")
 
-    csv_path = os.path.join(out_dir, "summary.csv")
-    cols = list(rows[0].keys())
-    with open(csv_path, "w", encoding="utf-8") as f:
-        f.write(",".join(cols) + "\n")
-        for r in rows:
-            f.write(",".join(str(r[c]) for c in cols) + "\n")
-    print(f"Saved: {csv_path}")
-
-    # -------------------------------------------------------------------------
-    # Plots
-    # -------------------------------------------------------------------------
-    # Validity/Confidence scatter
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for v, c, label in val_points:
-        ax.scatter(v, c, s=35)
-        ax.annotate(label, (v, c), fontsize=7, alpha=0.9)
-    ax.set_xlabel(f"Validity (P(max) ≥ {validity_thresh})")
-    ax.set_ylabel("Mean confidence")
-    ax.set_title("Sample quality (fixed MNISTFeatureNet)")
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "sample_validity.pdf"), format="pdf", bbox_inches="tight")
-    plt.close(fig)
-
-    # FID bar plot (sorted)
-    fid_sorted = sorted(fid_points, key=lambda t: t[0])
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ax.bar([n for _, n in fid_sorted], [v for v, _ in fid_sorted])
-    ax.set_ylabel("MNIST-FID (feature space)")
-    ax.set_title("MNIST-FID using MNISTFeatureNet (lower is better)")
-    ax.tick_params(axis="x", rotation=45)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "fid_scores.pdf"), format="pdf", bbox_inches="tight")
-    plt.close(fig)
-
-    # Label histograms multi-page
-    hist_pdf_path = os.path.join(out_dir, "label_histograms.pdf")
-    with PdfPages(hist_pdf_path) as pdf:
-        for counts, label in label_hists:
-            fig, ax = plt.subplots(figsize=(7, 4))
-            ax.bar(list(range(10)), counts)
-            ax.set_xlabel("Predicted label")
-            ax.set_ylabel("Count")
-            ax.set_title(f"Label histogram — {label}")
-            fig.tight_layout()
-            pdf.savefig(fig)
-            plt.close(fig)
-    print(f"Saved: {hist_pdf_path}")
-
-    print(f"Saved quickcheck PDFs in: {qc_dir}")
     return rows

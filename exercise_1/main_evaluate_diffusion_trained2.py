@@ -1,9 +1,7 @@
 import torch
-from utils.evaluate_diffusion_trained2 import evaluate_all_models  # adjust path if needed
+from utils.evaluate_diffusion_trained2 import evaluate_all_models
 
-
-root_path="/content/drive/MyDrive/University_of_Copenhagen/block6/PML/final_assignment/exercise_1" 
-
+root_path="/content/drive/MyDrive/University_of_Copenhagen/block6/PML/final_assignment/exercise_1"
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 rows = evaluate_all_models(
@@ -12,10 +10,10 @@ rows = evaluate_all_models(
     data_dir=f"{root_path}/mnist_data",
     device=device,
     feature_net_ckpt="/content/PML_FINAL_ASSIGNMENT/exercise_1/utils/models/mnist_feature_net.pt",
-    pixel_ckpt_dir="/content/PML_FINAL_ASSIGNMENT/exercise_1/utils/models",                 # folder you mentioned
-    baseline_ckpt_name="baseline_ddpm_ema.pt",      # file name
-    flow_ckpt_name="flow_matching.pt",              # file name
-    pixel_output_mode="auto",                       # auto | 0_1 | minus1_1
+    pixel_ckpt_dir="/content/PML_FINAL_ASSIGNMENT/exercise_1/utils/models",
+    baseline_ckpt_name="baseline_ddpm_ema.pt",
+    flow_ckpt_name="flow_matching.pt",
+    pixel_output_mode="minus1_1",   # auto | 0_1 | minus1_1
     n_gen=5000,
     quickcheck=True,
     quickcheck_cols=12,
