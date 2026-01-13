@@ -6,7 +6,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 root_path="/content/drive/MyDrive/University_of_Copenhagen/block6/PML/final_assignment/exercise_1" 
 rows = evaluate_diffusion_runs(
     run_root=f"{root_path}/runs_diffusion",
-    out_dir=f"{root_path}/runs_diffusion/summary_fixed_net",
+    out_dir=f"{root_path}/runs_diffusion/summary_fixed_net_2",
     data_dir=f"{root_path}/mnist_data",
     device=device,
     feature_net_ckpt="/content/PML_FINAL_ASSIGNMENT/exercise_1/utils/mnist_feature_net.pt",
@@ -17,4 +17,4 @@ rows = evaluate_diffusion_runs(
     quickcheck_cols=12,
 )
 
-print(f"Done. See {root_path}/runs_diffusion/summary_fixed_net/")
+print(f"Done. See {root_path}/runs_diffusion/summary_fixed_net_2/")
