@@ -1,4 +1,39 @@
 # evaluate_diffusion.py
+"""
+Evaluate latent diffusion priors (DDPM + Continuous VP-SDE) trained in runs_diffusion/.
+
+Evaluator is a FIXED, pre-trained MNIST feature net saved as "mnist_feature_net.pt".
+No classifier training happens here, so metrics are consistent across runs.
+
+For each diffusion run dir, we evaluate:
+- vae_prior: decode z ~ N(0, I) (baseline)
+- ddpm: sample z from latent DDPM prior -> unscale -> VAE decode
+- cont: sample z from continuous VP-SDE prior -> unscale -> VAE decode
+
+Metrics per (run, model_type):
+- MNIST-FID (feature space)  ↓
+- Mean confidence            ↑
+- Unique digits (valid only) ↑
+- Sampling time (s)          (TOTAL time for n_gen samples; includes prior sampling + VAE decode)
+(Plus: validity, label entropy, etc.)
+
+Quickcheck PDFs (saved into out_dir/quickcheck/):
+- Reconstruction: 2 rows × 12 columns (originals + reconstructions) -> one PDF per run
+- Generated samples: 1 row × 12 columns -> one PDF per (run, model_type)
+
+Outputs in out_dir:
+- summary.csv
+- sample_validity.pdf
+- fid_scores.pdf
+- label_histograms.pdf
+
+Assumes each diffusion run has:
+  config.json (contains "vae_run_dir" and training params)
+  models/ddpm.pt
+  models/cont.pt
+  latents/mnist_latents_mu.pt  (mean/std for unscaling)
+"""
+
 from __future__ import annotations
 
 import os
@@ -15,6 +50,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 
+# Project imports
 from utils.VAE import BetaVAE
 from utils.latent_utils import load_latent_checkpoint
 from utils.diffusion import LatentDenoiser, LatentDDPM, VPSDE, load_vae_from_run
@@ -80,7 +116,7 @@ def load_feature_net(ckpt_path: str, device: torch.device, feat_dim: int = 128) 
 
 
 # =========================
-# Real features cache (for MNIST-FID)
+# Real features cache (for MNIST-FID) + fixed 12 images for recon grid
 # =========================
 @torch.no_grad()
 def compute_or_load_real_features(
@@ -96,7 +132,7 @@ def compute_or_load_real_features(
     """
     Returns:
       feat_real: [n_val, feat_dim] CPU
-      fixed_x12: [12,1,28,28] CPU (first 12 from the same fixed val split) for quickcheck recon
+      fixed_x12: [12,1,28,28] CPU (first 12 from the same fixed val split)
     """
     _ensure_dir(out_dir)
     cache_path = os.path.join(out_dir, "mnist_real_features.pt")
@@ -105,15 +141,17 @@ def compute_or_load_real_features(
     full = datasets.MNIST(data_dir, train=True, download=True, transform=transform)
     n_train = len(full) - n_val
     _, ds_val = random_split(full, [n_train, n_val], generator=torch.Generator().manual_seed(seed))
-    dl_val = DataLoader(ds_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    dl_val12 = DataLoader(ds_val, batch_size=12, shuffle=False, num_workers=num_workers, pin_memory=True)
 
+    # fixed 12 images for reconstruction visualization (deterministic)
+    dl_val12 = DataLoader(ds_val, batch_size=12, shuffle=False, num_workers=num_workers, pin_memory=True)
     fixed_x12, _ = next(iter(dl_val12))
     fixed_x12 = fixed_x12.cpu()
 
     if os.path.exists(cache_path):
         ck = torch.load(cache_path, map_location="cpu")
         return ck["feat_real"], fixed_x12
+
+    dl_val = DataLoader(ds_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
     feats = []
     feat_net.eval()
@@ -144,7 +182,7 @@ def classifier_metrics(
 
     preds, confs, feats = [], [], []
     for i in range(0, N, batch_size):
-        x = images[i:i+batch_size].to(device)
+        x = images[i:i + batch_size].to(device)
         logits, feat = feat_net(x, return_features=True)
         prob = F.softmax(logits, dim=1)
         conf, pred = prob.max(dim=1)
@@ -161,20 +199,17 @@ def classifier_metrics(
     entropy = float(-(p * (p + 1e-12).log()).sum().item())  # nats
 
     valid_mask = confs >= validity_thresh
-    if valid_mask.any():
-        unique_digits = int(torch.unique(preds[valid_mask]).numel())
-    else:
-        unique_digits = 0
+    validity = float(valid_mask.float().mean().item())
+
+    unique_digits = int(torch.unique(preds[valid_mask]).numel()) if valid_mask.any() else 0
 
     return {
-        "validity": float(valid_mask.float().mean().item()),
+        "validity": validity,
         "mean_conf": float(confs.mean().item()),
         "counts": counts.numpy(),
         "label_entropy_nats": entropy,
         "unique_digits": unique_digits,
-        "features": feats,       # CPU
-        "preds": preds,          # CPU
-        "confs": confs,          # CPU
+        "features": feats,  # CPU
     }
 
 
@@ -242,23 +277,29 @@ def decode_scaled_latents(
 
 
 # =========================
-# Quickcheck plots
+# Quickcheck figs (separate PDFs)
 # =========================
 @torch.no_grad()
-def fig_recon_grid(vae: BetaVAE, x12_cpu: torch.Tensor, device: torch.device, title: str) -> plt.Figure:
+def fig_recon_2xN(vae: BetaVAE, x_cpu: torch.Tensor, device: torch.device, title: str) -> plt.Figure:
+    """
+    2 rows × N cols: top originals, bottom reconstructions (deterministic via mu).
+    """
     vae.eval()
-    x = x12_cpu.to(device)
-    # deterministic reconstruction via mu (avoid sampling noise)
+    x = x_cpu.to(device)
     logits, mu, logvar, z = vae(x, sample_latent=False)
     x_hat = torch.sigmoid(logits).detach().cpu()
 
-    n = x12_cpu.size(0)
-    fig, axes = plt.subplots(2, n, figsize=(1.2 * n, 3.0))
+    n = x_cpu.size(0)
+    fig, axes = plt.subplots(2, n, figsize=(1.2 * n, 2.8))
+    if n == 1:
+        axes = np.array([[axes[0]], [axes[1]]])
+
     for i in range(n):
-        axes[0, i].imshow(x12_cpu[i, 0], cmap="gray")
+        axes[0, i].imshow(x_cpu[i, 0], cmap="gray")
         axes[0, i].axis("off")
         axes[1, i].imshow(x_hat[i, 0], cmap="gray")
         axes[1, i].axis("off")
+
     axes[0, 0].set_title("Original", fontsize=10)
     axes[1, 0].set_title("Reconstruction", fontsize=10)
     fig.suptitle(title)
@@ -267,25 +308,18 @@ def fig_recon_grid(vae: BetaVAE, x12_cpu: torch.Tensor, device: torch.device, ti
 
 
 @torch.no_grad()
-def fig_samples_grid(samples_by_type: Dict[str, torch.Tensor], title: str) -> plt.Figure:
+def fig_images_1xN(imgs_cpu: torch.Tensor, title: str) -> plt.Figure:
     """
-    samples_by_type: dict model_type -> images [12,1,28,28] CPU
-    Creates a grid: rows = model types, cols = 12
+    1 row × N cols grid.
     """
-    types = list(samples_by_type.keys())
-    rows = len(types)
-    cols = samples_by_type[types[0]].size(0)
+    n = imgs_cpu.size(0)
+    fig, axes = plt.subplots(1, n, figsize=(1.2 * n, 1.4))
+    if n == 1:
+        axes = [axes]
 
-    fig, axes = plt.subplots(rows, cols, figsize=(1.2 * cols, 1.4 * rows))
-    if rows == 1:
-        axes = np.expand_dims(axes, axis=0)
-
-    for r, t in enumerate(types):
-        imgs = samples_by_type[t]
-        for c in range(cols):
-            axes[r, c].imshow(imgs[c, 0], cmap="gray")
-            axes[r, c].axis("off")
-        axes[r, 0].set_ylabel(t, rotation=0, labelpad=20, fontsize=10, va="center")
+    for i in range(n):
+        axes[i].imshow(imgs_cpu[i, 0], cmap="gray")
+        axes[i].axis("off")
 
     fig.suptitle(title)
     fig.tight_layout()
@@ -310,10 +344,14 @@ def evaluate_diffusion_runs(
 ) -> List[Dict[str, Any]]:
     _ensure_dir(out_dir)
 
+    # quickcheck folder
+    qc_dir = os.path.join(out_dir, "quickcheck")
+    _ensure_dir(qc_dir)
+
     # fixed evaluator
     feat_net = load_feature_net(feature_net_ckpt, device=device, feat_dim=128)
 
-    # fixed real features + fixed 12 images for recon
+    # fixed real features + fixed images for recon
     feat_real, fixed_x12 = compute_or_load_real_features(
         feat_net=feat_net,
         data_dir=data_dir,
@@ -340,9 +378,6 @@ def evaluate_diffusion_runs(
     fid_points: List[Tuple[float, str]] = []
     val_points: List[Tuple[float, float, str]] = []
 
-    qc_pdf = os.path.join(out_dir, "quickcheck.pdf")
-    qc_writer = PdfPages(qc_pdf) if quickcheck else None
-
     for ddir in run_dirs:
         name = os.path.basename(ddir)
         cfg = _read_json(os.path.join(ddir, "config.json")) or {}
@@ -359,26 +394,25 @@ def evaluate_diffusion_runs(
             print(f"[Skip] {name}: missing latents/mnist_latents_mu.pt")
             continue
 
+        # Load VAE + latent stats
         vae = load_vae_from_run(vae_run_dir, device=device)
         latent_ckpt = load_latent_checkpoint(latent_path)
         mean = latent_ckpt["mean"]
         std = latent_ckpt["std"]
         latent_dim = int(latent_ckpt["meta"]["latent_dim"])
 
-        # quickcheck: recon page (VAE-only, but attached to diffusion run)
-        if qc_writer is not None:
-            fig = fig_recon_grid(vae, fixed_x12[:quickcheck_cols], device=device,
-                                 title=f"{name} — Reconstructions (VAE)")
-            qc_writer.savefig(fig)
+        # ---- Quickcheck: recon 2x12 (one PDF per run)
+        if quickcheck:
+            xN = fixed_x12[:quickcheck_cols].cpu()
+            recon_pdf = os.path.join(qc_dir, f"{name}__recon_2x{quickcheck_cols}.pdf")
+            fig = fig_recon_2xN(vae, xN, device=device, title=f"{name} — Recon (originals + reconstructions)")
+            fig.savefig(recon_pdf, format="pdf", bbox_inches="tight")
             plt.close(fig)
 
-        # For sample-grid quickcheck
-        qc_samples: Dict[str, torch.Tensor] = {}
-
-        # -------- vae_prior (baseline) with timing
+        # ---------- VAE prior (baseline) ----------
         t0 = time.perf_counter()
         imgs_vae = generate_vae_prior_samples(vae, device=device, n=n_gen)
-        sampling_time = time.perf_counter() - t0
+        sampling_time = time.perf_counter() - t0  # TOTAL for n_gen
 
         m = classifier_metrics(feat_net, imgs_vae, device=device, validity_thresh=validity_thresh)
         fid = fid_from_features(feat_real, m["features"])
@@ -388,10 +422,11 @@ def evaluate_diffusion_runs(
             "run_name": name,
             "model_type": "vae_prior",
             "latent_dim": latent_dim,
-            "mnist_fid": fid,
-            "mean_conf": m["mean_conf"],
-            "unique_digits": m["unique_digits"],
-            "sampling_time_s": float(sampling_time),
+            "mnist_fid": fid,                 # ↓
+            "mean_conf": m["mean_conf"],      # ↑
+            "unique_digits": m["unique_digits"],  # ↑ (valid only)
+            "sampling_time_s": float(sampling_time),  # TOTAL for n_gen
+            # extra helpful metrics
             "gen_validity": m["validity"],
             "gen_label_entropy_nats": m["label_entropy_nats"],
             "diffusion_run_dir": ddir,
@@ -400,14 +435,15 @@ def evaluate_diffusion_runs(
         label_hists.append((m["counts"], label))
         fid_points.append((fid, label))
         val_points.append((m["validity"], m["mean_conf"], label))
-
         print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={sampling_time:.2f}s")
 
-        if qc_writer is not None:
-            qc_samples["vae_prior"] = imgs_vae[:quickcheck_cols].cpu()
+        if quickcheck:
+            gen_pdf = os.path.join(qc_dir, f"{name}__gen__vae_prior_1x{quickcheck_cols}.pdf")
+            fig = fig_images_1xN(imgs_vae[:quickcheck_cols].cpu(), title=f"{name} — Generated (vae_prior)")
+            fig.savefig(gen_pdf, format="pdf", bbox_inches="tight")
+            plt.close(fig)
 
-        # -------- DDPM
-        ddpm = None
+        # ---------- DDPM prior ----------
         if os.path.exists(ddpm_path):
             ddpm_ckpt = torch.load(ddpm_path, map_location=device)
             den = LatentDenoiser(
@@ -423,9 +459,9 @@ def evaluate_diffusion_runs(
             ddpm = LatentDDPM(den, latent_dim=latent_dim, T=T, device=device)
 
             t0 = time.perf_counter()
-            z_scaled = ddpm.sample(n_gen)
+            z_scaled = ddpm.sample(n_gen)  # [N,d] on device (scaled space)
             imgs = decode_scaled_latents(vae, z_scaled, mean, std, device=device)
-            sampling_time = time.perf_counter() - t0
+            sampling_time = time.perf_counter() - t0  # TOTAL for n_gen
 
             m = classifier_metrics(feat_net, imgs, device=device, validity_thresh=validity_thresh)
             fid = fid_from_features(feat_real, m["features"])
@@ -447,15 +483,17 @@ def evaluate_diffusion_runs(
             label_hists.append((m["counts"], label))
             fid_points.append((fid, label))
             val_points.append((m["validity"], m["mean_conf"], label))
-
             print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={sampling_time:.2f}s")
 
-            if qc_writer is not None:
-                qc_samples["ddpm"] = imgs[:quickcheck_cols].cpu()
+            if quickcheck:
+                gen_pdf = os.path.join(qc_dir, f"{name}__gen__ddpm_1x{quickcheck_cols}.pdf")
+                fig = fig_images_1xN(imgs[:quickcheck_cols].cpu(), title=f"{name} — Generated (ddpm)")
+                fig.savefig(gen_pdf, format="pdf", bbox_inches="tight")
+                plt.close(fig)
         else:
             print(f"[Warn] {name}: missing models/ddpm.pt")
 
-        # -------- Continuous VP-SDE
+        # ---------- Continuous VP-SDE prior ----------
         if os.path.exists(cont_path):
             cont_ckpt = torch.load(cont_path, map_location=device)
             den = LatentDenoiser(
@@ -476,7 +514,7 @@ def evaluate_diffusion_runs(
             t0 = time.perf_counter()
             z_scaled = cont.sample(n_gen, steps=steps)
             imgs = decode_scaled_latents(vae, z_scaled, mean, std, device=device)
-            sampling_time = time.perf_counter() - t0
+            sampling_time = time.perf_counter() - t0  # TOTAL for n_gen
 
             m = classifier_metrics(feat_net, imgs, device=device, validity_thresh=validity_thresh)
             fid = fid_from_features(feat_real, m["features"])
@@ -498,23 +536,15 @@ def evaluate_diffusion_runs(
             label_hists.append((m["counts"], label))
             fid_points.append((fid, label))
             val_points.append((m["validity"], m["mean_conf"], label))
-
             print(f"[Eval] {label} | fid={fid:.2f} conf={m['mean_conf']:.3f} uniq={m['unique_digits']} time={sampling_time:.2f}s")
 
-            if qc_writer is not None:
-                qc_samples["cont"] = imgs[:quickcheck_cols].cpu()
+            if quickcheck:
+                gen_pdf = os.path.join(qc_dir, f"{name}__gen__cont_1x{quickcheck_cols}.pdf")
+                fig = fig_images_1xN(imgs[:quickcheck_cols].cpu(), title=f"{name} — Generated (cont)")
+                fig.savefig(gen_pdf, format="pdf", bbox_inches="tight")
+                plt.close(fig)
         else:
             print(f"[Warn] {name}: missing models/cont.pt")
-
-        # quickcheck: generated samples page
-        if qc_writer is not None and len(qc_samples) > 0:
-            fig = fig_samples_grid(qc_samples, title=f"{name} — Generated samples")
-            qc_writer.savefig(fig)
-            plt.close(fig)
-
-    if qc_writer is not None:
-        qc_writer.close()
-        print(f"Saved: {qc_pdf}")
 
     # =========================
     # Save summary.csv
@@ -530,6 +560,7 @@ def evaluate_diffusion_runs(
     # =========================
     # Plots
     # =========================
+    # Validity/Confidence scatter
     fig, ax = plt.subplots(figsize=(8, 5))
     for v, c, label in val_points:
         ax.scatter(v, c, s=35)
@@ -541,6 +572,7 @@ def evaluate_diffusion_runs(
     fig.savefig(os.path.join(out_dir, "sample_validity.pdf"), format="pdf", bbox_inches="tight")
     plt.close(fig)
 
+    # FID bar plot (sorted)
     fid_sorted = sorted(fid_points, key=lambda t: t[0])
     fig, ax = plt.subplots(figsize=(11, 4))
     ax.bar([n for _, n in fid_sorted], [v for v, _ in fid_sorted])
@@ -551,6 +583,7 @@ def evaluate_diffusion_runs(
     fig.savefig(os.path.join(out_dir, "fid_scores.pdf"), format="pdf", bbox_inches="tight")
     plt.close(fig)
 
+    # Label histograms multi-page
     hist_pdf_path = os.path.join(out_dir, "label_histograms.pdf")
     with PdfPages(hist_pdf_path) as pdf:
         for counts, label in label_hists:
@@ -563,5 +596,8 @@ def evaluate_diffusion_runs(
             pdf.savefig(fig)
             plt.close(fig)
     print(f"Saved: {hist_pdf_path}")
+
+    if quickcheck:
+        print(f"Saved quickcheck PDFs in: {qc_dir}")
 
     return rows
