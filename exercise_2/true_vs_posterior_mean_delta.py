@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Path to your summary (update if needed)
+# Path to your summary
 df = pd.read_csv("exercise_2/results_b2_3_9_10/tables/delta_posterior_summary.csv")
 
 x = df["Delta_true"].to_numpy()
@@ -32,7 +32,7 @@ plt.xlabel(r"True input error $\Delta_i^{\mathrm{true}}$")
 plt.ylabel(r"Posterior mean $\mathbb{E}[\Delta_i \mid X,y]$")
 plt.title(r"Recovery of $\Delta$: posterior mean vs truth (95% CI)")
 
-# Optional: label points by index i (can clutter; comment out if too busy)
+# Optional: label points by index i
 for _, r in df.iterrows():
     plt.annotate(
         str(int(r["i"])),

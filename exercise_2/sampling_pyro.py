@@ -4,7 +4,6 @@ import pyro
 from pyro.infer.mcmc import NUTS, MCMC, HMC
 
 
-#note: running parallel chains is broken in some jupyter notebook environments. just run the scripts in your terminal.
 def sample_likelihood(log_likelihood_fn, init_samples, warmup_steps, num_samples, step_size):
     
     def potential_fn(params): #the potential functions used by NUTS/HMC are the negative log-likelihood. 
@@ -36,7 +35,6 @@ L = torch.randn(D,D,dtype=torch.float64)
 C=L@L.T
 normal_dist = TorchMVN(torch.zeros(D,dtype=torch.float64), covariance_matrix = C)
 
-#we want to use 4 parallel chains so we crease 4 initial samples
 init_samples = torch.randn(4,D,dtype=torch.float64)
 samples = sample_likelihood(normal_dist.log_prob, init_samples, 500, 500, 0.1)
 

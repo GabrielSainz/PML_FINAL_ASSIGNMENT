@@ -1,4 +1,4 @@
-# python exercise_2/gp_b1_baseline.py --data exercise_2/data_part_B.csv --outdir exercise_2/results_b1_gp --ngrid2 120 --ngrid3 100
+# python exercise_2/gp_b1_baseline.py --data exercise_2/data_part_B.csv --outdir exercise_2/results_b1_gp_2 --ngrid2 120 --ngrid3 120
 from __future__ import annotations
 
 import argparse
@@ -459,7 +459,7 @@ def main():
 
     kernels = {
         "RBF": kernel_rbf,
-        "Matern52": kernel_matern52,
+        #"Matern52": kernel_matern52,
     }
 
     # Prepare variants

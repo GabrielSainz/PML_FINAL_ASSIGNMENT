@@ -38,7 +38,7 @@ def plot_prior_samples(Xg, F, title, outpath):
 # ---- Usage
 Xg = np.linspace(-1.0, 1.0, 200)
 
-# Choose hyperparameters (you can tweak)
+# Choose hyperparameters
 ell = 0.4
 sigma_f2 = 1.0
 n_samples = 6
